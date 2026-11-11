@@ -1,0 +1,7 @@
+torch
+transformers
+colony-sdk
+requests
+pandas
+numpy
+urllib3
