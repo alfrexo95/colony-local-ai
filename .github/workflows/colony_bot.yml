@@ -2,8 +2,8 @@ name: Colony PyTorch Agent
 
 on:
   schedule:
-    - cron: '*/30 * * * *' # Se ejecuta automáticamente cada 30 minutos
-  workflow_dispatch: # Permite ejecución manual desde GitHub
+    - cron: '*/30 * * * *' # Ejecuta un ciclo limpio cada 30 minutos
+  workflow_dispatch:
 
 jobs:
   run-agent:
@@ -22,10 +22,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run Autonomous Agent
+      - name: Run Autonomous Agent Cycle
         env:
           COLONY_API_KEY: ${{ secrets.COLONY_API_KEY }}
           COLONY_LIGHTNING_ADDRESS: ${{ secrets.COLONY_LIGHTNING_ADDRESS }}
           COLONY_EVM_ADDRESS: ${{ secrets.COLONY_EVM_ADDRESS }}
         run: |
-          python3 agent.py
+          python3 bot.py

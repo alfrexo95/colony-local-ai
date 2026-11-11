@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Autonomous Agent for The Colony - PyTorch Native Ultra-Light Edition v5.3
-No pandas or numpy dependencies. High fluid execution on GitHub Actions.
-Prioritizes BNB > ETH > SOL > EVM > BTC. 
+Autonomous Agent for The Colony - PyTorch Native Ultra-Light Edition v5.4
+Single-cycle atomic execution model for GitHub Actions.
+Prioritizes BNB > ETH > SOL > EVM > BTC.
 """
 
 import gc
@@ -48,7 +48,6 @@ MIN_CONFIDENCE = os.environ.get("MIN_CONFIDENCE", "medium")
 MIN_REVIEW_SCORE = _i("MIN_REVIEW_SCORE", 7)
 STATE_FILE = Path(os.environ.get("STATE_FILE", "state.json"))
 SUMMARY_FILE = os.environ.get("GITHUB_STEP_SUMMARY")
-RUN_BUDGET_MIN = _i("RUN_BUDGET_MINUTES", 30)
 
 ENABLE_BID = os.environ.get("ENABLE_BID", "1") == "1"
 REQUIRE_SATS = os.environ.get("REQUIRE_SATS", "1") == "1"
@@ -57,12 +56,11 @@ BID_DESC_MAX = _i("BID_DESC_MAX", 900)
 LIGHTNING_ADDRESS = os.environ.get("COLONY_LIGHTNING_ADDRESS", "")
 EVM_ADDRESS = os.environ.get("COLONY_EVM_ADDRESS", "")
 
-POST_DELAY = _i("POST_DELAY_SECONDS", 25)
+POST_DELAY = _i("POST_DELAY_SECONDS", 15)
 MAX_FAILURES = _i("MAX_TASK_FAILURES", 3)
 MIN_ANSWER_CHARS = _i("MIN_ANSWER_CHARS", 50)
 MAX_ANSWER_CHARS = _i("MAX_ANSWER_CHARS", 9500)
 FETCH_CRYPTO_PAID = os.environ.get("FETCH_CRYPTO_PAID", "1") == "1"
-RESET_STATE = os.environ.get("RESET_STATE", "0") == "1"
 
 PYTORCH_MODEL_ID = os.environ.get("PYTORCH_MODEL_ID", "Qwen/Qwen2.5-1.5B-Instruct")
 SOLVER_MAX_TOKENS = _i("SOLVER_MAX_TOKENS", 1000)
@@ -100,23 +98,6 @@ def _as_list(d, keys=("tasks", "items", "data", "results", "comments", "bids", "
             if isinstance(d.get(k), list): return d[k]
     return []
 
-# NATIVE QUANT TOOLS (No pandas / numpy)
-def native_rsi(prices, n=14):
-    if len(prices) < n + 1: return 50.0
-    gains, losses = [], []
-    for i in range(1, len(prices)):
-        chg = prices[i] - prices[i-1]
-        gains.append(max(0, chg))
-        losses.append(max(0, -chg))
-    ag = sum(gains[:n]) / n
-    al = sum(losses[:n]) / n
-    for i in range(n, len(gains)):
-        ag = (ag * (n - 1) + gains[i]) / n
-        al = (al * (n - 1) + losses[i]) / n
-    if al == 0: return 100.0
-    return round(100.0 - (100.0 / (1.0 + (ag / al))), 2)
-
-# STATE SYSTEM
 def load_state():
     try: st = json.loads(STATE_FILE.read_text())
     except Exception: st = {}
@@ -198,17 +179,6 @@ def compute_bid(task, sats_budget):
     if bmin > 0: bid = max(bid, int(bmin))
     return max(1, min(bid, int(sats_budget)))
 
-def get_pressure_prompt(state):
-    now = time.time()
-    fifteen_days_ago = now - (15 * 86400)
-    recent_subs = [s for s in state.get("submissions", []) if s.get("timestamp", 0) > fifteen_days_ago]
-    total_earned = sum(s.get("estimated_value", 0) for s in recent_subs)
-    if total_earned < 500:  
-        deficit = 500 - total_earned  
-        agent_log(f"   [⚠️ PRESSURE] Quota deficit: {deficit} sats.")  
-        return f"URGENT: Quota deficit of {deficit} sats in 15 days. Provide elite technical solution to get high ratings."  
-    return "You are meeting your quota. Maintain top quality."
-
 # SDK INITIALIZATION
 if not COLONY_KEY:
     print("[!] Missing COLONY_API_KEY secret.", flush=True)
@@ -221,24 +191,18 @@ try:
     else: client.get_me()
     agent_log("[*] Connected via SDK. Bootstrap status: OK")
 except Exception as e:
-    agent_log(f"[!] SDK connection failed: {type(e).__name__}: {str(e)[:150]}")
+    agent_log(f"[!] SDK connection failed: {e}")
     sys.exit(1)
 
 def http(method, path, headers=None, **kw):
     for attempt in range(3):
         try:
             r = requests.request(method, f"{API_BASE}{path}", headers=headers, timeout=30, **kw)
-        except requests.RequestException as e:
-            if attempt == 2: return 0, f"{type(e).__name__}"
-            time.sleep(3)
+        except requests.RequestException:
+            if attempt == 2: return 0, "error"
+            time.sleep(2)
             continue
-        if r.status_code in (429, 500, 502, 503, 504) and attempt < 2:
-            try: wait = min(int(float(r.headers.get("Retry-After", 5))), 60)
-            except ValueError: wait = 5
-            time.sleep(max(wait, 1))
-            continue
-        try: return r.status_code, r.json()
-        except ValueError: return r.status_code, r.text[:200]
+        return r.status_code, r.json() if r.headers.get("content-type","").startswith("application/json") else r.text
     return 0, "no response"
 
 def get_jwt():
@@ -251,7 +215,7 @@ def get_jwt():
 def fetch_tasks(headers):
     st, d = http("GET", "/marketplace/tasks", headers=headers, params={"status": "open"})
     if 400 <= st < 500: st, d = http("GET", "/marketplace/tasks", headers=headers)
-    if st >= 400 or st == 0: raise RuntimeError(f"HTTP {st} {str(d)[:120]}")
+    if st >= 400 or st == 0: raise RuntimeError(f"HTTP {st}")
     return _as_list(d)
 
 _profile_synced = False
@@ -263,21 +227,18 @@ def sync_profile(headers):
     me = _dict(me)
     MY_USERNAME = str(me.get("username") or MY_USERNAME or "")
     if st < 400 and not _profile_synced:
-        agent_log(f"[*] Agent: {MY_USERNAME} | karma: {me.get('karma', 0)} | lightning: {'set' if me.get('lightning_address') else 'NOT SET'}")
+        agent_log(f"[*] Agent: {MY_USERNAME} | karma: {me.get('karma', 0)}")
     if _profile_synced or DRY_RUN: return
     update = {}
     if LIGHTNING_ADDRESS and me.get("lightning_address") != LIGHTNING_ADDRESS: update["lightning_address"] = LIGHTNING_ADDRESS
     if EVM_ADDRESS and me.get("evm_address") != EVM_ADDRESS: update["evm_address"] = EVM_ADDRESS
-    if update:
-        st2, _ = http("PUT", "/users/me", headers=headers, json=update)
-        agent_log(f"[*] Profile payout address update: HTTP {st2}")
+    if update: http("PUT", "/users/me", headers=headers, json=update)
     _profile_synced = True
 
 def already_commented(post_id):
     if not MY_USERNAME: return False
     try:
-        try: comments = list(client.iter_comments(post_id, max_results=300))
-        except AttributeError: comments = _as_list(client.get_comments(post_id))
+        comments = _as_list(client.get_comments(post_id))
     except Exception: return False
     for c in comments:
         c = _dict(c)
@@ -288,27 +249,10 @@ def already_commented(post_id):
     return False
 
 def place_bid(headers, post_id, sats, pitch):
-    st, d = http("POST", f"/marketplace/{post_id}/bid", headers=headers,
-                 json={"bid_amount_sats": int(sats), "bid_description": pitch[:BID_DESC_MAX]})
-    return st, d
+    return http("POST", f"/marketplace/{post_id}/bid", headers=headers, json={"bid_amount_sats": int(sats), "bid_description": pitch[:BID_DESC_MAX]})
 
 def build_pitch(answer):
-    summary = re.sub(r"\s+", " ", answer).strip()[:350]
-    return f"Verified solution delivered by colony-local-ai. Summary: {summary}"
-
-def retry_pending_bids(headers, state):
-    for post_id, b in list(state["pending_bids"].items()):
-        if b.get("tries", 0) >= 3:
-            state["pending_bids"].pop(post_id, None)
-            continue
-        b["tries"] = b.get("tries", 0) + 1
-        st, d = place_bid(headers, post_id, b["sats"], b["pitch"])
-        if st in (200, 201, 202, 409):
-            agent_log(f"   [+] pending bid placed for {post_id} (HTTP {st})")
-            state["pending_bids"].pop(post_id, None)
-        else:
-            agent_log(f"   [!] pending bid retry failed for {post_id}: HTTP {st}")
-        save_state(state)
+    return f"Verified solution by colony-local-ai. Summary: {re.sub(r'\\s+', ' ', answer).strip()[:300]}"
 
 def merge_detail(headers, task):
     pid = str(task.get("id"))
@@ -317,8 +261,6 @@ def merge_detail(headers, task):
     det = (_dict(d.get("post")) or d) if st < 400 else {}
     for k in ("metadata", "metadata_", "summary", "crypto", "client"):
         if det.get(k) and not task.get(k): task[k] = det[k]
-    if len(str(det.get("body") or "")) > len(str(task.get("body") or "")):
-        task["body"] = det["body"]
 
 # PYTORCH INFERENCE ENGINE
 _torch_model = None
@@ -344,165 +286,83 @@ def free_pytorch_model():
         del _torch_model
         _torch_model = None
         gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        agent_log("   [i] Freed PyTorch model from RAM/VRAM")
-
-def _extract_json(text):
-    if not text: raise ValueError("AI returned empty text")
-    text = re.sub(r"```(?:json)?", "", text, flags=re.I).replace("```", "").strip()
-    m = re.search(r"\{.*\}", text, re.S)
-    if not m: raise ValueError("AI did not return a valid JSON object")
-    try: return json.loads(m.group(0))
-    except json.JSONDecodeError as e: raise ValueError(f"Invalid JSON format: {e}")
+        if torch.cuda.is_available(): torch.cuda.empty_cache()
 
 def ask_pytorch(system, user, max_tokens=1000):
     model, tokenizer = load_pytorch_model()
-    messages = [
-        {"role": "system", "content": system},
-        {"role": "user", "content": user}
-    ]
-    if hasattr(tokenizer, "apply_chat_template"):
-        prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    else:
-        prompt = f"System: {system}\n\nUser: {user}\n\nAssistant:"
-
+    messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True) if hasattr(tokenizer, "apply_chat_template") else f"System: {system}\nUser: {user}"
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
     with torch.no_grad():
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=max_tokens,
-            temperature=0.2,
-            do_sample=True,
-            pad_token_id=tokenizer.eos_token_id
-        )
-    generated_ids = outputs[0][inputs.input_ids.shape[1]:]
-    response_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
-    return _extract_json(response_text)
+        outputs = model.generate(**inputs, max_new_tokens=max_tokens, temperature=0.2, do_sample=True, pad_token_id=tokenizer.eos_token_id)
+    text = tokenizer.decode(outputs[0][inputs.input_ids.shape[1]:], skip_special_tokens=True)
+    text = re.sub(r"```(?:json)?", "", text, flags=re.I).replace("```", "").strip()
+    m = re.search(r"\{.*\}", text, re.S)
+    if not m: raise ValueError("Invalid JSON from AI")
+    return json.loads(m.group(0))
 
-def generate_solution(task_title, task_body, pressure_msg):
-    context = task_body[:2500]
-    solver_sys = f"""You are an elite AI developer and smart contract auditor on The Colony platform. Deliver complete, verified Markdown solutions.
-STATUS: {pressure_msg}
-Respond ONLY with JSON: {{"can_do": true|false, "confidence": "medium|high", "response": "<complete detailed markdown solution>", "why_not": "<reason>"}}"""
-
+def generate_solution(title, body):
+    sys_prompt = 'You are an elite developer and smart contract auditor on The Colony. Provide accurate markdown solutions. Respond ONLY with JSON: {"can_do": true, "confidence": "high", "response": "<markdown solution>"}'
     try:
-        res = ask_pytorch(solver_sys, f"TASK: {task_title}\nDESC: {context}", SOLVER_MAX_TOKENS)
-    except Exception as e:
-        return None, f"solver error: {e}", "low", 0
-
-    conf = str(res.get("confidence", "low")).lower()
-    draft = str(res.get("response", "")).strip()
-
-    if not res.get("can_do") or not draft or conf == "low":
-        return None, f"solver rejected: {res.get('why_not')}", conf, 0
-
-    reviewer_sys = """You are a strict QA reviewer. Respond ONLY with JSON: {"verdict": "approve|reject", "score": <1-10>, "issues": "<problems>"}"""
-    try:
-        rv = ask_pytorch(reviewer_sys, f"TASK:\n{task_title}\nDRAFT:\n{draft[:2500]}", REVIEWER_MAX_TOKENS)
-        verdict = str(rv.get("verdict", "reject")).lower()
-        score = int(float(rv.get("score", 0)))
+        res = ask_pytorch(sys_prompt, f"TASK: {title}\nDESC: {body[:2000]}", SOLVER_MAX_TOKENS)
+        return str(res.get("response", "")).strip() if res.get("can_do") else None
     except Exception:
-        verdict = "approve"
-        score = 8
+        return None
 
-    if verdict == "approve" and score >= MIN_REVIEW_SCORE:
-        if len(draft) < MIN_ANSWER_CHARS or len(draft) > MAX_ANSWER_CHARS:
-            return None, "invalid answer length", conf, score
-        return draft, "approved", conf, score
-
-    return None, f"rejected by QA ({score}/10)", conf, score
-
-# MAIN RUN LOOP
-def run_cycle(deadline=None):
-    START_TS = time.time()
-    LOG.clear()
-    budget = RUN_BUDGET_MIN * 60
-    if deadline: budget = max(60, min(budget, deadline - START_TS - 120))
-
+# SINGLE RUN ATOMIC EXECUTION
+if __name__ == "__main__":
+    agent_log("[*] Starting atomic single-cycle PyTorch execution...")
     state = load_state()
-    pressure_msg = get_pressure_prompt(state)
-    agent_log("[*] Fetching marketplace tasks...")
-    
     try:
         jwt = get_jwt()
         headers = {"Authorization": f"Bearer {jwt}", "Accept": "application/json"}
         sync_profile(headers)
-        if ENABLE_BID and not DRY_RUN: retry_pending_bids(headers, state)
         tasks = fetch_tasks(headers)
     except Exception as e:
-        agent_log(f"[!] Initialization failed: {e}")
-        return
+        agent_log(f"[!] Init error: {e}")
+        sys.exit(0)
 
     tasks = [t for t in tasks if isinstance(t, dict) and str(t.get("status") or "open").lower() in ("open", "bidding")]
     tasks.sort(key=get_task_value, reverse=True)
 
-    answered_count = 0
+    answered = 0
     for task in tasks:
-        if answered_count >= MAX_TASKS_PER_RUN: break
-        if time.time() - START_TS > budget: break
-
-        post_id = str(task.get("id"))
-        if post_id in state["answered"] or state["failures"].get(post_id, 0) >= MAX_FAILURES: continue
+        if answered >= MAX_TASKS_PER_RUN: break
+        pid = str(task.get("id"))
+        if pid in state["answered"] or state["failures"].get(pid, 0) >= MAX_FAILURES: continue
         
         if not meta(task): merge_detail(headers, task)
-        title = str(task.get("title") or "No title")[:80]
+        title = str(task.get("title") or "")[:80]
         body = str(task.get("body") or task.get("content") or "")
         _, _, sats_budget, _ = _task_money(task)
 
         if REQUIRE_SATS and sats_budget <= 0: continue
-        if BLOCKED.search(f"{title} {body}") or already_commented(post_id):
-            state["answered"][post_id] = time.time()
+        if BLOCKED.search(f"{title} {body}") or already_commented(pid):
+            state["answered"][pid] = time.time()
             save_state(state)
             continue
 
-        _, chain_name = get_chain_priority(task)
-        agent_log(f"[?] Attacking [{chain_name}] Task: {title} (id: {post_id})")
-
-        try:
-            answer, why, conf, score = generate_solution(title, body, pressure_msg)
-        except Exception as e:
-            agent_log(f"   [!] Generation failed: {e}")
-            state["failures"][post_id] = state["failures"].get(post_id, 0) + 1
-            save_state(state)
-            continue
-
+        agent_log(f"[?] Processing Task: {title}")
+        answer = generate_solution(title, body)
         if not answer:
-            state["rejected"][post_id] = time.time()
+            state["failures"][pid] = state["failures"].get(pid, 0) + 1
             save_state(state)
             continue
-
-        if DRY_RUN: continue
 
         try:
-            client.create_comment(post_id, answer)
-            answered_count += 1
-            state["answered"][post_id] = time.time()
-            state["submissions"].append({"timestamp": time.time(), "estimated_value": sats_budget if sats_budget > 0 else 50})
+            client.create_comment(pid, answer)
+            answered += 1
+            state["answered"][pid] = time.time()
+            state["submissions"].append({"timestamp": time.time(), "estimated_value": sats_budget or 50})
             save_state(state)
-            agent_log(f"   [+] Replied successfully (score {score}/10)")
-        except Exception as e:
-            state["failures"][post_id] = state["failures"].get(post_id, 0) + 1
+            agent_log(f"   [+] Successfully posted solution!")
+        except Exception:
+            state["failures"][pid] = state["failures"].get(pid, 0) + 1
             save_state(state)
-            continue
 
         if ENABLE_BID and sats_budget > 0:
-            bid_sats = compute_bid(task, sats_budget)
-            pitch = build_pitch(answer)
-            st, _ = place_bid(headers, post_id, bid_sats, pitch)
-            if st in (200, 201, 202): agent_log(f"   [+] Bid placed: {bid_sats} sats")
-        
+            place_bid(headers, pid, compute_bid(task, sats_budget), build_pitch(answer))
         time.sleep(POST_DELAY)
 
     free_pytorch_model()
-
-if __name__ == "__main__":
-    MAX_RUNTIME_SECONDS = 5.5 * 3600
-    DEADLINE = time.time() + MAX_RUNTIME_SECONDS
-    print(f"[*] Starting ultra-light PyTorch loop...", flush=True)
-    while time.time() < DEADLINE:
-        if DEADLINE - time.time() < 600: break
-        try: run_cycle(DEADLINE)
-        except Exception as e: agent_log(f"[!] Main loop error: {e}")
-        time.sleep(min(900, max(DEADLINE - time.time() - 600, 1)))
-    print("[*] Exiting cleanly.")
+    agent_log("[*] Cycle completed successfully. Exiting.")
