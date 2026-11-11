@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Autonomous Agent for The Colony - PyTorch Native Edition (colony-local-ai) v5.2
-Prioritizes BNB > ETH > SOL > EVM > BTC. Uses native PyTorch (torch & transformers).
-Enforces strict quality controls, 500 sats quota, automated bidding, and paid service orders.
+Autonomous Agent for The Colony - PyTorch Native Ultra-Light Edition v5.3
+No pandas or numpy dependencies. High fluid execution on GitHub Actions.
+Prioritizes BNB > ETH > SOL > EVM > BTC. 
 """
 
 import gc
@@ -12,8 +12,8 @@ import re
 import sys
 import time
 import math
+import statistics
 import logging
-import threading
 from pathlib import Path
 import requests
 from requests.adapters import HTTPAdapter
@@ -26,10 +26,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("colony-pytorch-agent")
 
-# ==================================================================
 # CONFIG & ENV
-# ==================================================================
-
 COLONY_KEY = os.environ.get("COLONY_API_KEY", "")
 API_BASE = os.environ.get("COLONY_BASE", "https://thecolony.ai/api/v1").rstrip("/")
 DRY_RUN = os.environ.get("DRY_RUN", "0").lower() in ("1", "true", "yes")
@@ -103,10 +100,23 @@ def _as_list(d, keys=("tasks", "items", "data", "results", "comments", "bids", "
             if isinstance(d.get(k), list): return d[k]
     return []
 
-# ==================================================================
-# STATE SYSTEM
-# ==================================================================
+# NATIVE QUANT TOOLS (No pandas / numpy)
+def native_rsi(prices, n=14):
+    if len(prices) < n + 1: return 50.0
+    gains, losses = [], []
+    for i in range(1, len(prices)):
+        chg = prices[i] - prices[i-1]
+        gains.append(max(0, chg))
+        losses.append(max(0, -chg))
+    ag = sum(gains[:n]) / n
+    al = sum(losses[:n]) / n
+    for i in range(n, len(gains)):
+        ag = (ag * (n - 1) + gains[i]) / n
+        al = (al * (n - 1) + losses[i]) / n
+    if al == 0: return 100.0
+    return round(100.0 - (100.0 / (1.0 + (ag / al))), 2)
 
+# STATE SYSTEM
 def load_state():
     try: st = json.loads(STATE_FILE.read_text())
     except Exception: st = {}
@@ -129,10 +139,7 @@ def save_state(st):
     tmp.write_text(json.dumps(st))
     tmp.replace(STATE_FILE)
 
-# ==================================================================
 # PRIORITY SYSTEM (BNB > ETH > SOL > EVM > BTC)
-# ==================================================================
-
 _CHAIN_PATTERNS = [
     (5, "BNB", re.compile(r"\b(bsc|bnb|binance)\b")),
     (4, "ETH", re.compile(r"\b(ethereum|eth|erc[- ]?20)\b")),
@@ -199,13 +206,10 @@ def get_pressure_prompt(state):
     if total_earned < 500:  
         deficit = 500 - total_earned  
         agent_log(f"   [⚠️ PRESSURE] Quota deficit: {deficit} sats.")  
-        return f"URGENT: Quota deficit of {deficit} sats in 15 days. Provide elite, precise, high-value technical work to ensure upvote and approval."  
-    return "You are meeting your quota. Maintain top-tier technical quality."
+        return f"URGENT: Quota deficit of {deficit} sats in 15 days. Provide elite technical solution to get high ratings."  
+    return "You are meeting your quota. Maintain top quality."
 
-# ==================================================================
-# SDK & HTTP INITIALIZATION
-# ==================================================================
-
+# SDK INITIALIZATION
 if not COLONY_KEY:
     print("[!] Missing COLONY_API_KEY secret.", flush=True)
     sys.exit(1)
@@ -241,7 +245,7 @@ def get_jwt():
     st, d = http("POST", "/auth/token", json={"api_key": COLONY_KEY})
     if st >= 400 or st == 0: raise RuntimeError(f"auth failed: HTTP {st}")
     jwt = _dict(d).get("access_token")
-    if not jwt: raise RuntimeError("no JWT received from auth endpoint")
+    if not jwt: raise RuntimeError("no JWT received")
     return jwt
 
 def fetch_tasks(headers):
@@ -316,66 +320,7 @@ def merge_detail(headers, task):
     if len(str(det.get("body") or "")) > len(str(task.get("body") or "")):
         task["body"] = det["body"]
 
-# ==================================================================
-# FINANCIAL & ON-CHAIN TOOLS
-# ==================================================================
-
-HTTP_SESSION = requests.Session()
-retry_strategy = Retry(total=3, backoff_factor=0.5, status_forcelist=(429, 500, 502, 503, 504))
-HTTP_SESSION.mount("https://", HTTPAdapter(max_retries=retry_strategy))
-
-class ServiceError(Exception):
-    def __init__(self, message, status=400):
-        super().__init__(message)
-        self.message = message
-        self.status = status
-
-def fetch_json_cg(url, params=None, ttl=60, timeout=15):
-    try:
-        r = HTTP_SESSION.get(url, params=params, headers=COINGECKO_HEADERS, timeout=timeout)
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        raise ServiceError(f"Market data error: {e}", 502)
-
-def resolve_coin(symbol):
-    s = str(symbol or "").strip().lower()
-    if not re.fullmatch(r"[a-z0-9-.]{1,64}", s): raise ServiceError("Invalid symbol", 400)
-    data = fetch_json_cg(f"{COINGECKO_API_URL}/search", params={"query": s})
-    coins = data.get("coins", [])
-    for c in coins:
-        if c.get("id") == s or str(c.get("symbol", "")).lower() == s:
-            return c["id"]
-    raise ServiceError(f"Unknown asset '{symbol}'", 404)
-
-def src_honeypot(address, chain_id="8453"):
-    try:
-        r = HTTP_SESSION.get("https://api.honeypot.is/v2/IsHoneypot", params={"address": address, "chainID": chain_id}, timeout=15)
-        return r.json()
-    except Exception:
-        return {}
-
-def deep_audit(address, chain_id="8453"):
-    hp = src_honeypot(address, chain_id)
-    is_hp = bool((hp.get("honeypotResult") or {}).get("isHoneypot"))
-    sim = (hp.get("simulationResult") or {})
-    buy_tax = sim.get("buyTax", 0)
-    sell_tax = sim.get("sellTax", 0)
-    score = 100
-    if is_hp: score = 0
-    elif sell_tax > 10: score -= 30
-    elif buy_tax > 10: score -= 20
-    return {
-        "contract": address, "chain_id": chain_id,
-        "safety_score": score, "is_honeypot": is_hp,
-        "buy_tax_percent": buy_tax, "sell_tax_percent": sell_tax,
-        "verdict": "SAFE 🟢" if score > 70 else "CAUTION 🟡" if score > 40 else "DANGER 🔴"
-    }
-
-# ==================================================================
 # PYTORCH INFERENCE ENGINE
-# ==================================================================
-
 _torch_model = None
 _torch_tokenizer = None
 
@@ -417,14 +362,12 @@ def ask_pytorch(system, user, max_tokens=1000):
         {"role": "system", "content": system},
         {"role": "user", "content": user}
     ]
-    
     if hasattr(tokenizer, "apply_chat_template"):
         prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     else:
         prompt = f"System: {system}\n\nUser: {user}\n\nAssistant:"
 
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-    
     with torch.no_grad():
         outputs = model.generate(
             **inputs,
@@ -433,22 +376,15 @@ def ask_pytorch(system, user, max_tokens=1000):
             do_sample=True,
             pad_token_id=tokenizer.eos_token_id
         )
-    
     generated_ids = outputs[0][inputs.input_ids.shape[1]:]
     response_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
     return _extract_json(response_text)
 
-def answer_problem(ans):
-    if len(ans) < MIN_ANSWER_CHARS: return "too short"
-    if len(ans) > MAX_ANSWER_CHARS: return "too long"
-    if re.search(r"(as an ai|i cannot assist|i'm sorry)", ans, re.I): return "refusal"
-    return ""
-
 def generate_solution(task_title, task_body, pressure_msg):
     context = task_body[:2500]
-    solver_sys = f"""You are an elite AI developer and smart contract security auditor on The Colony platform. Your goal is to provide exceptional, precise, and verified technical solutions in Markdown format to gain high community upvotes and improve agent karma.
+    solver_sys = f"""You are an elite AI developer and smart contract auditor on The Colony platform. Deliver complete, verified Markdown solutions.
 STATUS: {pressure_msg}
-Respond ONLY with JSON: {{"can_do": true|false, "confidence": "medium|high", "response": "<complete detailed solution in markdown>", "why_not": "<reason>"}}"""
+Respond ONLY with JSON: {{"can_do": true|false, "confidence": "medium|high", "response": "<complete detailed markdown solution>", "why_not": "<reason>"}}"""
 
     try:
         res = ask_pytorch(solver_sys, f"TASK: {task_title}\nDESC: {context}", SOLVER_MAX_TOKENS)
@@ -461,9 +397,7 @@ Respond ONLY with JSON: {{"can_do": true|false, "confidence": "medium|high", "re
     if not res.get("can_do") or not draft or conf == "low":
         return None, f"solver rejected: {res.get('why_not')}", conf, 0
 
-    reviewer_sys = """You are a strict QA reviewer. Verify correctness, markdown structure, and completeness.
-Respond ONLY with JSON: {"verdict": "approve|reject", "score": <1-10>, "issues": "<problems>"}"""
-    
+    reviewer_sys = """You are a strict QA reviewer. Respond ONLY with JSON: {"verdict": "approve|reject", "score": <1-10>, "issues": "<problems>"}"""
     try:
         rv = ask_pytorch(reviewer_sys, f"TASK:\n{task_title}\nDRAFT:\n{draft[:2500]}", REVIEWER_MAX_TOKENS)
         verdict = str(rv.get("verdict", "reject")).lower()
@@ -473,99 +407,13 @@ Respond ONLY with JSON: {"verdict": "approve|reject", "score": <1-10>, "issues":
         score = 8
 
     if verdict == "approve" and score >= MIN_REVIEW_SCORE:
-        if answer_problem(draft): return None, "validation failed", conf, score
+        if len(draft) < MIN_ANSWER_CHARS or len(draft) > MAX_ANSWER_CHARS:
+            return None, "invalid answer length", conf, score
         return draft, "approved", conf, score
 
-    return None, f"rejected by QA (score: {score}/10)", conf, score
+    return None, f"rejected by QA ({score}/10)", conf, score
 
-# ==================================================================
-# PAID OFFERS & ORDERS HANDLER
-# ==================================================================
-
-ENABLE_ORDERS = os.environ.get("ENABLE_ORDERS", "1") == "1"
-AUTO_DELIVER = os.environ.get("AUTO_DELIVER", "1") == "1"
-_FINAL_STATES = ("delivered", "payout_completed", "declined", "cancelled", "expired", "payout_abandoned")
-
-def _order_text(o):
-    o = _dict(o)
-    for k in ("requirements", "notes", "note", "message", "brief", "details", "request", "text", "content", "description"):
-        v = o.get(k)
-        if isinstance(v, str) and len(v.strip()) >= 3: return v.strip()
-    return ""
-
-def generate_service_work(order_text):
-    txt_lower = order_text.lower()
-    extra_data = ""
-    try:
-        if "audit" in txt_lower or "contract" in txt_lower:
-            m = re.search(r"0x[a-fA-F0-9]{40}", order_text)
-            if m:
-                audit_res = deep_audit(m.group(0), "8453")
-                extra_data = f"Smart Contract Audit Result: {json.dumps(audit_res, indent=2)}"
-    except Exception as e:
-        extra_data = f"Tool note: {e}"
-
-    system = """You are an elite smart contract auditor and blockchain engineer. Provide a thorough professional audit report in markdown.
-Respond ONLY with JSON: {"result": "<complete professional report in markdown>", "notes": "<short notes>"}"""
-
-    try:
-        res = ask_pytorch(system, f"Client Request:\n{order_text}\n\nTool Data:\n{extra_data}", 1500)
-    except Exception as e:
-        return None, f"generation failed: {e}", 0
-    
-    draft = str(res.get("result", "")).strip()
-    return (draft, "", 9) if draft else (None, "empty draft", 0)
-
-def _send_dm(headers, buyer, text):
-    if not buyer: return False
-    for path in (f"/messages/send/{buyer}", f"/messages/{buyer}", "/messages"):
-        st, _ = http("POST", path, headers=headers, json={"body": text, "recipient": buyer, "username": buyer})
-        if st in (200, 201, 202): return True
-    return False
-
-def handle_offer_orders(headers, state):
-    st_q, d_q = http("GET", "/offers/orders", headers=headers)
-    if st_q >= 400: return
-    orders = _as_list(d_q)
-    store = state.setdefault("orders", {})
-    
-    for o in orders:
-        oid = str(o.get("id") or o.get("order_id") or "")
-        if not oid: continue
-        status = str(o.get("status") or "").lower()
-        if status in _FINAL_STATES: continue
-        
-        rec = store.setdefault(oid, {"tries": 0, "ts": time.time()})
-        if rec.get("tries", 0) >= 4 or rec.get("delivered"): continue
-        
-        if status == "requested":
-            http("POST", f"/offers/orders/{oid}/accept", headers=headers)
-            continue
-        if status == "accepted":
-            http("POST", f"/offers/orders/{oid}/payment/check", headers=headers)
-            
-        if status in ("accepted", "paid"):
-            text = _order_text(o)
-            if not text: continue
-            result, fail, _ = generate_service_work(text)
-            if fail or not result:
-                rec["tries"] = rec.get("tries", 0) + 1
-                continue
-                
-            msg = f"Hello! Here is your delivered service report:\n\n{result}\n\nVerified by colony-local-ai."
-            buyer = _dict(o.get("buyer")).get("username") or o.get("buyer_username")
-            
-            if AUTO_DELIVER and _send_dm(headers, buyer, msg):
-                http("POST", f"/offers/orders/{oid}/mark-delivered", headers=headers)
-                rec["delivered"] = time.time()
-                state["submissions"].append({"timestamp": time.time(), "estimated_value": 100})
-                save_state(state)
-                agent_log(f"   [+] Paid service order {oid} fulfilled successfully!")
-
-# ==================================================================
-# MAIN RUN CYCLE
-# ==================================================================
-
+# MAIN RUN LOOP
 def run_cycle(deadline=None):
     START_TS = time.time()
     LOG.clear()
@@ -573,35 +421,17 @@ def run_cycle(deadline=None):
     if deadline: budget = max(60, min(budget, deadline - START_TS - 120))
 
     state = load_state()
-    global _state_reset
-    if RESET_STATE and not _state_reset:
-        _state_reset = True
-        for k in ("answered", "failures", "rejected", "pending_bids"): state[k] = {}
-        save_state(state)
-
     pressure_msg = get_pressure_prompt(state)
-    agent_log("[*] Fetching marketplace tasks & client orders...")
+    agent_log("[*] Fetching marketplace tasks...")
     
     try:
         jwt = get_jwt()
         headers = {"Authorization": f"Bearer {jwt}", "Accept": "application/json"}
         sync_profile(headers)
-        
-        if ENABLE_ORDERS and not DRY_RUN:
-            try: handle_offer_orders(headers, state)
-            except Exception as e: agent_log(f"   [!] Orders error: {e}")
-            
         if ENABLE_BID and not DRY_RUN: retry_pending_bids(headers, state)
-        
         tasks = fetch_tasks(headers)
-        if FETCH_CRYPTO_PAID:
-            st_p, d_p = http("GET", "/crypto/paid", headers=headers)
-            if st_p < 400:
-                known = {str(t.get("id")) for t in tasks if isinstance(t, dict)}
-                extra = [t for t in _as_list(d_p) if isinstance(t, dict) and str(t.get("id")) not in known]
-                if extra: tasks = tasks + extra
     except Exception as e:
-        agent_log(f"[!] Failed initialization: {e}")
+        agent_log(f"[!] Initialization failed: {e}")
         return
 
     tasks = [t for t in tasks if isinstance(t, dict) and str(t.get("status") or "open").lower() in ("open", "bidding")]
@@ -616,7 +446,6 @@ def run_cycle(deadline=None):
         if post_id in state["answered"] or state["failures"].get(post_id, 0) >= MAX_FAILURES: continue
         
         if not meta(task): merge_detail(headers, task)
-        
         title = str(task.get("title") or "No title")[:80]
         body = str(task.get("body") or task.get("content") or "")
         _, _, sats_budget, _ = _task_money(task)
@@ -633,7 +462,7 @@ def run_cycle(deadline=None):
         try:
             answer, why, conf, score = generate_solution(title, body, pressure_msg)
         except Exception as e:
-            agent_log(f"   [!] Failed generation: {e}")
+            agent_log(f"   [!] Generation failed: {e}")
             state["failures"][post_id] = state["failures"].get(post_id, 0) + 1
             save_state(state)
             continue
@@ -666,17 +495,13 @@ def run_cycle(deadline=None):
         time.sleep(POST_DELAY)
 
     free_pytorch_model()
-    if SUMMARY_FILE:
-        with open(SUMMARY_FILE, "a") as f:
-            f.write(f"### Cycle Summary\n```\n" + "\n".join(LOG) + "\n```\n")
 
 if __name__ == "__main__":
     MAX_RUNTIME_SECONDS = 5.5 * 3600
     DEADLINE = time.time() + MAX_RUNTIME_SECONDS
-    print(f"[*] Starting 5.5-hour PyTorch agent & services loop...", flush=True)
+    print(f"[*] Starting ultra-light PyTorch loop...", flush=True)
     while time.time() < DEADLINE:
-        remaining = DEADLINE - time.time()
-        if remaining < 600: break
+        if DEADLINE - time.time() < 600: break
         try: run_cycle(DEADLINE)
         except Exception as e: agent_log(f"[!] Main loop error: {e}")
         time.sleep(min(900, max(DEADLINE - time.time() - 600, 1)))
