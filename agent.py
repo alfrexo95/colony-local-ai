@@ -1,36 +1,44 @@
 #!/usr/bin/env python3
 """
-Autonomous Agent for The Colony - PyTorch Native Edition v7.1
-Fixed f-string regex backslash syntax error permanently.
+Autonomous Agent for The Colony - Elite PyTorch Native Edition v8.0
+Features: Marketplace tasks, multi-chain priority (BNB > ETH > SOL > EVM > BTC),
+12 service offers, automated order processing, Wallet of Satoshi Lightning integration,
+and 5.5-hour continuous loop execution.
 """
 
-import gc
+import concurrent.futures
+import hashlib
+import ipaddress
 import json
+import math
 import os
 import re
+import socket
 import sys
 import time
-import logging
+from html.parser import HTMLParser
 from pathlib import Path
+from urllib.parse import urljoin, urlparse
+
 import requests
 from colony_sdk import ColonyClient
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("colony-pytorch-agent")
-
 # CONFIG & ENV
-COLONY_KEY = os.environ.get("COLONY_API_KEY", "")
+COLONY_KEY = os.environ.get("COLONY_API_KEY", "").strip()
 API_BASE = os.environ.get("COLONY_BASE", "https://thecolony.ai/api/v1").rstrip("/")
 DRY_RUN = os.environ.get("DRY_RUN", "0").lower() in ("1", "true", "yes")
-
-LIGHTNING_ADDRESS = os.environ.get("COLONY_LIGHTNING_ADDRESS", "chieftrait089@walletofsatoshi.com")
-EVM_ADDRESS = os.environ.get("COLONY_EVM_ADDRESS", "")
+WEB_SEARCH = os.environ.get("WEB_SEARCH", "1") == "1"
 
 MAX_TASKS_PER_RUN = 3
+MIN_REVIEW_SCORE = 6
 STATE_FILE = Path("state.json")
+
+# Configuración de pagos y Lightning (Wallet of Satoshi)
+LIGHTNING_ADDRESS = os.environ.get("COLONY_LIGHTNING_ADDRESS", "chieftrait089@walletofsatoshi.com")
+EVM_ADDRESS = os.environ.get("COLONY_EVM_ADDRESS", "").strip()
 
 ENABLE_BID = True
 REQUIRE_SATS = True
@@ -39,8 +47,9 @@ BID_DESC_MAX = 900
 REST_INTERVAL_MINUTES = 10
 TOTAL_RUN_HOURS = 5.5
 
-PYTORCH_MODEL_ID = os.environ.get("PYTORCH_MODEL_ID", "Qwen/Qwen2.5-1.5B-Instruct")
+MODEL_ID = os.environ.get("LOCAL_MODEL", "Qwen/Qwen2.5-1.5B-Instruct").strip()
 SOLVER_MAX_TOKENS = 1000
+REVIEWER_MAX_TOKENS = 400
 
 BLOCKED = re.compile(
     r"\b(seed phrase|mnemonic|private key|password|2fa|otp code|ssh key|credit card|doxx|doxxing|"
@@ -54,7 +63,7 @@ def _num(x, default=0.0):
     try: return float(x)
     except (TypeError, ValueError): return default
 
-def meta(task):
+def _meta(task):
     for key in ("metadata", "metadata_"):
         m = task.get(key)
         if isinstance(m, str):
@@ -70,27 +79,24 @@ def _as_list(d, keys=("tasks", "items", "data", "results", "comments", "bids", "
             if isinstance(d.get(k), list): return d[k]
     return []
 
+# STATE MANAGEMENT
 def load_state():
-    try:
-        if STATE_FILE.exists():
-            st = json.loads(STATE_FILE.read_text())
-        else:
-            st = {}
-    except Exception:
-        st = {}
+    try: st = json.loads(STATE_FILE.read_text())
+    except Exception: st = {}
     st.setdefault("answered", {})
     st.setdefault("submissions", [])
     st.setdefault("failures", {})
+    st.setdefault("pending_bids", {})
     st.setdefault("completed_orders", {})
     return st
 
 def save_state(st):
-    cutoff = time.time() - 45 * 86400
+    cutoff = time.time() - 30 * 86400
     st["answered"] = {k: v for k, v in st["answered"].items() if v > cutoff}
     st["submissions"] = [s for s in st["submissions"] if s.get("timestamp", 0) > cutoff]
     st["failures"] = {k: v for k, v in st["failures"].items() if k not in st["answered"]}
     tmp = STATE_FILE.with_suffix(".tmp")
-    tmp.write_text(json.dumps(st, indent=2))
+    tmp.write_text(json.dumps(st))
     tmp.replace(STATE_FILE)
 
 # CHAIN PRIORITY (BNB > ETH > SOL > EVM > BTC)
@@ -118,7 +124,7 @@ def _chain_key(c):
 
 def get_chain_priority(task):
     chains = []
-    reward = meta(task).get("reward")
+    reward = _meta(task).get("reward")
     if isinstance(reward, dict): chains.append(_dict(reward.get("asset")).get("chain"))
     refs = _dict(task.get("crypto")).get("refs")
     if isinstance(refs, list): chains.extend(_dict(r).get("chain") for r in refs)
@@ -131,14 +137,14 @@ def get_chain_priority(task):
     return 0, "OTHER"
 
 def get_task_value(task):
-    metadata = meta(task)
+    metadata = _meta(task)
     reward = metadata.get("reward")
     token_amt = _num(reward.get("amount") if isinstance(reward, dict) else reward)
     sats_budget = _num(metadata.get("budget_max_sats"))
     chain_prio, _ = get_chain_priority(task)
     return (chain_prio, 1 if token_amt > 0 else 0, sats_budget, token_amt)
 
-# SDK & HTTP
+# SDK & HTTP INITIALIZATION
 if not COLONY_KEY:
     print("[!] Missing COLONY_API_KEY secret.", flush=True)
     sys.exit(1)
@@ -186,8 +192,7 @@ def sync_profile(headers):
     if EVM_ADDRESS and me.get("evm_address") != EVM_ADDRESS:
         update["evm_address"] = EVM_ADDRESS
     if update:
-        st_up, _ = http("PUT", "/users/me", headers=headers, json=update)
-        agent_log(f"[*] Updated profile addresses: HTTP {st_up} (Lightning -> {LIGHTNING_ADDRESS})")
+        http("PUT", "/users/me", headers=headers, json=update)
     return MY_USERNAME
 
 def already_commented_on_platform(post_id):
@@ -217,7 +222,6 @@ def fetch_all_tasks(headers):
         known = {str(t.get("id")) for t in tasks if isinstance(t, dict)}
         extra = [t for t in _as_list(d_p) if isinstance(t, dict) and str(t.get("id")) not in known]
         if extra: tasks.extend(extra)
-        
     return tasks
 
 def handle_client_orders(headers, state):
@@ -263,17 +267,17 @@ def handle_client_orders(headers, state):
                     save_state(state)
                     agent_log(f"   [+] Service order {oid} successfully fulfilled and delivered!")
 
-# PYTORCH
+# PYTORCH AI INFERENCE
 _torch_model = None
 _torch_tokenizer = None
 
 def load_pytorch_model():
     global _torch_model, _torch_tokenizer
     if _torch_model is None:
-        agent_log(f"[*] Loading PyTorch model {PYTORCH_MODEL_ID}...")
-        _torch_tokenizer = AutoTokenizer.from_pretrained(PYTORCH_MODEL_ID)
+        agent_log(f"[*] Loading PyTorch model {MODEL_ID}...")
+        _torch_tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
         _torch_model = AutoModelForCausalLM.from_pretrained(
-            PYTORCH_MODEL_ID,
+            MODEL_ID,
             torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
             device_map="auto" if torch.cuda.is_available() else None
         )
@@ -302,10 +306,10 @@ def generate_solution(title, body):
     except Exception:
         return None
 
-# CONTINUOUS LOOP
+# CONTINUOUS LOOP (5.5 HOURS WITH 10 MIN REST)
 def run_continuous_agent():
     deadline = time.time() + (TOTAL_RUN_HOURS * 3600)
-    agent_log(f"[*] Starting 5.5-hour continuous agent loop with strict memory & platform sync...")
+    agent_log(f"[*] Starting 5.5-hour continuous elite agent loop...")
     
     while time.time() < deadline:
         cycle_start = time.time()
@@ -338,7 +342,7 @@ def run_continuous_agent():
             
             title = str(task.get("title") or "")[:80]
             body = str(task.get("body") or task.get("content") or "")
-            metadata = meta(task)
+            metadata = _meta(task)
             sats_budget = _num(metadata.get("budget_max_sats"))
 
             if REQUIRE_SATS and sats_budget <= 0: continue
