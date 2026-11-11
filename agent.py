@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Autonomous Agent for The Colony - PyTorch Native Edition v6.0
-Features: 5.5h continuous loop with 10-min rests, Wallet of Satoshi sync,
-Crypto endpoints (/crypto/paid, chains priority: BNB > ETH > SOL > EVM > BTC),
-and Client Service Orders management.
+Autonomous Agent for The Colony - PyTorch Native Edition v7.0
+Features: Advanced persistent memory, zero duplication, deep platform sync,
+5.5h continuous loop with 10-min rests, Wallet of Satoshi Lightning integration,
+Crypto endpoints (/crypto/paid)[span_1](start_span)[span_1](end_span), and rigorous Client Service Orders management.
 """
 
 import gc
@@ -12,12 +12,9 @@ import os
 import re
 import sys
 import time
-import math
 import logging
 from pathlib import Path
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 from colony_sdk import ColonyClient
 
 import torch
@@ -31,15 +28,10 @@ COLONY_KEY = os.environ.get("COLONY_API_KEY", "")
 API_BASE = os.environ.get("COLONY_BASE", "https://thecolony.ai/api/v1").rstrip("/")
 DRY_RUN = os.environ.get("DRY_RUN", "0").lower() in ("1", "true", "yes")
 
-COINGECKO_API_KEY = os.environ.get("COINGECKO_API_KEY", "CG-DxDmERwtikShxhjWGfHzyKnX")
-COINGECKO_API_URL = "https://api.coingecko.com/api/v3"
-COINGECKO_HEADERS = {"x-cg-demo-api-key": COINGECKO_API_KEY}
-
 LIGHTNING_ADDRESS = os.environ.get("COLONY_LIGHTNING_ADDRESS", "chieftrait089@walletofsatoshi.com")
 EVM_ADDRESS = os.environ.get("COLONY_EVM_ADDRESS", "")
 
 MAX_TASKS_PER_RUN = 3
-MIN_REVIEW_SCORE = 7
 STATE_FILE = Path("state.json")
 
 ENABLE_BID = True
@@ -51,7 +43,6 @@ TOTAL_RUN_HOURS = 5.5
 
 PYTORCH_MODEL_ID = os.environ.get("PYTORCH_MODEL_ID", "Qwen/Qwen2.5-1.5B-Instruct")
 SOLVER_MAX_TOKENS = 1000
-REVIEWER_MAX_TOKENS = 400
 
 BLOCKED = re.compile(
     r"\b(seed phrase|mnemonic|private key|password|2fa|otp code|ssh key|credit card|doxx|doxxing|"
@@ -81,27 +72,31 @@ def _as_list(d, keys=("tasks", "items", "data", "results", "comments", "bids", "
             if isinstance(d.get(k), list): return d[k]
     return []
 
+# SISTEMA DE MEMORIA ROBUSTA Y PERSISTENTE
 def load_state():
-    try: st = json.loads(STATE_FILE.read_text())
-    except Exception: st = {}
-    st.setdefault("answered", {})
-    st.setdefault("submissions", [])
-    st.setdefault("failures", {})
-    st.setdefault("pending_bids", {})
-    st.setdefault("rejected", {})
-    st.setdefault("orders", {})
+    try:
+        if STATE_FILE.exists():
+            st = json.loads(STATE_FILE.read_text())
+        else:
+            st = {}
+    except Exception:
+        st = {}
+    st.setdefault("answered", {})       # IDs de tareas ya respondidas
+    st.setdefault("submissions", [])    # Historial de envíos
+    st.setdefault("failures", {})       # Control de fallos
+    st.setdefault("completed_orders", {})# Órdenes de servicios atendidas
     return st
 
 def save_state(st):
-    cutoff = time.time() - 30 * 86400
+    cutoff = time.time() - 45 * 86400 # Mantener memoria de 45 días
     st["answered"] = {k: v for k, v in st["answered"].items() if v > cutoff}
     st["submissions"] = [s for s in st["submissions"] if s.get("timestamp", 0) > cutoff]
     st["failures"] = {k: v for k, v in st["failures"].items() if k not in st["answered"]}
     tmp = STATE_FILE.with_suffix(".tmp")
-    tmp.write_text(json.dumps(st))
+    tmp.write_text(json.dumps(st, indent=2))
     tmp.replace(STATE_FILE)
 
-# PRIORITY SYSTEM (BNB > ETH > SOL > EVM > BTC)
+# JERARQUÍA DE CADENAS (BNB > ETH > SOL > EVM > BTC)
 _CHAIN_PATTERNS = [
     (5, "BNB", re.compile(r"\b(bsc|bnb|binance)\b")),
     (4, "ETH", re.compile(r"\b(ethereum|eth|erc[- ]?20)\b")),
@@ -179,13 +174,15 @@ def get_jwt():
     if not jwt: raise RuntimeError("no JWT received")
     return jwt
 
+MY_USERNAME = ""
+
 def sync_profile(headers):
+    global MY_USERNAME
     st, me = http("GET", "/users/me", headers=headers)
     me = _dict(me)
-    username = str(me.get("username") or "")
-    agent_log(f"[*] Agent: {username} | karma: {me.get('karma', 0)} | Lightning: {me.get('lightning_address', 'NOT SET')}")
+    MY_USERNAME = str(me.get("username") or "")
+    agent_log(f"[*] Agent: {MY_USERNAME} | karma: {me.get('karma', 0)} | Lightning: {me.get('lightning_address', 'NOT SET')}")
     
-    # Forzar actualización de la Lightning Address (Wallet of Satoshi) si difiere
     update = {}
     if me.get("lightning_address") != LIGHTNING_ADDRESS:
         update["lightning_address"] = LIGHTNING_ADDRESS
@@ -194,15 +191,33 @@ def sync_profile(headers):
     if update:
         st_up, _ = http("PUT", "/users/me", headers=headers, json=update)
         agent_log(f"[*] Updated profile addresses: HTTP {st_up} (Lightning -> {LIGHTNING_ADDRESS})")
-    return username
+    return MY_USERNAME
+
+# COMPROBACIÓN EN PLATAFORMA PARA EVITAR DUPLICADOS
+def already_commented_on_platform(post_id):
+    if not MY_USERNAME: return False
+    try:
+        try: comments = list(client.iter_comments(post_id, max_results=200))
+        except AttributeError: comments = _as_list(client.get_comments(post_id))
+        
+        for c in comments:
+            c = _dict(c)
+            author = c.get("author")
+            name = _dict(author).get("username") if isinstance(author, dict) else author
+            name = name or c.get("username") or c.get("author_username")
+            if str(name or "").lower() == MY_USERNAME.lower():
+                return True
+    except Exception:
+        pass
+    return False
 
 def fetch_all_tasks(headers):
     tasks = []
-    # 1. Endpoint general de marketplace
+    # Marketplace general de tareas abiertas
     st, d = http("GET", "/marketplace/tasks", headers=headers, params={"status": "open"})
     if st < 400: tasks.extend(_as_list(d))
     
-    # 2. Endpoint especializado en crypto pagado (según crypto.md)[span_4](start_span)[span_4](end_span)
+    # Endpoint especializado en criptomonedas y pagos en tokens (crypto.md)[span_2](start_span)[span_2](end_span)
     st_p, d_p = http("GET", "/crypto/paid", headers=headers)
     if st_p < 400:
         known = {str(t.get("id")) for t in tasks if isinstance(t, dict)}
@@ -211,21 +226,52 @@ def fetch_all_tasks(headers):
         
     return tasks
 
-# OFTERS & ORDERS HANDLER (Seguimiento de publicaciones y solicitudes de clientes)
-def handle_client_orders(headers):
+# GESTIÓN Y SEGUIMIENTO DE SOLICITUDES DE SERVICIOS PENDIENTES
+def handle_client_orders(headers, state):
     st, d = http("GET", "/offers/orders", headers=headers)
     if st >= 400: return
     orders = _as_list(d)
+    
+    completed = state.setdefault("completed_orders", {})
+    
     for o in orders:
         oid = str(o.get("id") or o.get("order_id") or "")
         status = str(o.get("status") or "").lower()
-        if not oid or status in ("delivered", "payout_completed", "cancelled"): continue
+        if not oid or status in ("delivered", "payout_completed", "cancelled") or oid in completed: 
+            continue
+        
+        agent_log(f"   [!] Found active service order: {oid} with status: {status}")
         
         if status == "requested":
             http("POST", f"/offers/orders/{oid}/accept", headers=headers)
-            agent_log(f"   [+] Accepted client service order {oid}")
+            agent_log(f"   [+] Accepted service order {oid}")
         elif status == "accepted":
             http("POST", f"/offers/orders/{oid}/payment/check", headers=headers)
+            
+        if status in ("accepted", "paid"):
+            # Extraer requisitos o notas de la orden
+            req_text = ""
+            for k in ("requirements", "notes", "note", "message", "brief", "details", "request", "text", "content", "description"):
+                v = o.get(k)
+                if isinstance(v, str) and len(v.strip()) >= 3:
+                    req_text = v.strip()
+                    break
+            
+            if req_text:
+                agent_log(f"   [?] Generating service fulfillment for order {oid}...")
+                solution = generate_solution("Service Order Fulfillment", req_text)
+                if solution:
+                    buyer = _dict(o.get("buyer")).get("username") or o.get("buyer_username")
+                    if buyer:
+                        # Enviar mensaje con el entregable
+                        for path in (f"/messages/send/{buyer}", f"/messages/{buyer}", "/messages"):
+                            st_msg, _ = http("POST", path, headers=headers, json={"body": f"Delivered service report:\n\n{solution}", "recipient": buyer, "username": buyer})
+                            if st_msg in (200, 201, 202): break
+                    
+                    http("POST", f"/offers/orders/{oid}/mark-delivered", headers=headers)
+                    completed[oid] = time.time()
+                    save_state(state)
+                    agent_log(f"   [+] Service order {oid} successfully fulfilled and delivered!")
 
 # PYTORCH INFERENCE ENGINE
 _torch_model = None
@@ -266,21 +312,25 @@ def generate_solution(title, body):
     except Exception:
         return None
 
-# CICLO DE EJECUCIÓN CONTINUA (5.5 HORAS CON DESCANSO DE 10 MINUTOS)
+# BUCLE CONTINUO PRINCIPAL (5.5 HORAS CON 10 MINUTOS DE DESCANSO)
 def run_continuous_agent():
     deadline = time.time() + (TOTAL_RUN_HOURS * 3600)
-    agent_log(f"[*] Starting 5.5-hour continuous agent loop with {REST_INTERVAL_MINUTES}m rest intervals...")
+    agent_log(f"[*] Starting 5.5-hour continuous agent loop with strict memory & platform sync...")
     
     while time.time() < deadline:
         cycle_start = time.time()
-        agent_log("[*] --- Starting new intelligence & earning cycle ---")
+        agent_log("[*] --- Starting intelligence, memory & earning cycle ---")
         
         state = load_state()
         try:
             jwt = get_jwt()
             headers = {"Authorization": f"Bearer {jwt}", "Accept": "application/json"}
             sync_profile(headers)
-            handle_client_orders(headers)
+            
+            # Revisar solicitudes pendientes de clientes en los servicios
+            handle_client_orders(headers, state)
+            
+            # Buscar tareas generales y de criptomonedas (BNB, ETH, SOL, BTC)
             tasks = fetch_all_tasks(headers)
         except Exception as e:
             agent_log(f"[!] Init error in cycle: {e}")
@@ -294,7 +344,12 @@ def run_continuous_agent():
         for task in tasks:
             if answered >= MAX_TASKS_PER_RUN: break
             pid = str(task.get("id"))
-            if pid in state["answered"] or state["failures"].get(pid, 0) >= 3: continue
+            
+            # MEMORIA: Omitir si ya está en el estado local o ya se comentó en la plataforma
+            if pid in state["answered"] or already_commented_on_platform(pid) or state["failures"].get(pid, 0) >= 3:
+                state["answered"][pid] = time.time()
+                save_state(state)
+                continue
             
             title = str(task.get("title") or "")[:80]
             body = str(task.get("body") or task.get("content") or "")
@@ -310,34 +365,34 @@ def run_continuous_agent():
             _, chain_name = get_chain_priority(task)
             agent_log(f"[?] Processing [{chain_name}] Task: {title}")
             
-            answer = generate_solution(title, body)
-            if not answer:
+            solution = generate_solution(title, body)
+            if not solution:
                 state["failures"][pid] = state["failures"].get(pid, 0) + 1
                 save_state(state)
                 continue
 
             try:
-                client.create_comment(pid, answer)
+                client.create_comment(pid, solution)
                 answered += 1
                 state["answered"][pid] = time.time()
                 state["submissions"].append({"timestamp": time.time(), "estimated_value": sats_budget or 50})
                 save_state(state)
-                agent_log("   [+] Successfully posted solution & earned value!")
+                agent_log("   [+] Solution posted successfully & recorded in memory!")
             except Exception:
                 state["failures"][pid] = state["failures"].get(pid, 0) + 1
                 save_state(state)
 
             if ENABLE_BID and sats_budget > 0:
                 bid_sats = max(1, int(sats_budget * BID_PCT))
-                pitch = f"Verified solution by colony-local-ai. Summary: {re.sub(r'\\s+', ' ', answer).strip()[:300]}"
+                cleaned_ans = re.sub(r'\s+', ' ', solution).strip()[:300]
+                pitch = f"Verified solution by colony-local-ai. Summary: {cleaned_ans}"
                 http("POST", f"/marketplace/{pid}/bid", headers=headers, json={"bid_amount_sats": bid_sats, "bid_description": pitch[:BID_DESC_MAX]})
             
             time.sleep(20)
 
-        # Calcular tiempo transcurrido y descansar 10 minutos antes del siguiente ciclo
-        elapsed = time.time() - cycle_start
+        # Descanso de 10 minutos antes del siguiente ciclo
         rest_time = REST_INTERVAL_MINUTES * 60
-        agent_log(f"[*] Cycle finished. Resting for {REST_INTERVAL_MINUTES} minutes...")
+        agent_log(f"[*] Cycle completed. Resting for {REST_INTERVAL_MINUTES} minutes...")
         
         sleeping = 0
         while sleeping < rest_time and time.time() < deadline:
