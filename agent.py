@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Autonomous Agent for The Colony - PyTorch Native Single-File Edition v5.5
-Zero external heavy dependencies (No pandas/numpy). Clean atomic cycle.
+Autonomous Agent for The Colony - PyTorch Native Single-File Edition v5.6
+Fixed f-string backslash syntax error for Python 3.10 compatibility.
 Prioritizes BNB > ETH > SOL > EVM > BTC.
 """
 
@@ -247,7 +247,8 @@ def place_bid(headers, post_id, sats, pitch):
     return http("POST", f"/marketplace/{post_id}/bid", headers=headers, json={"bid_amount_sats": int(sats), "bid_description": pitch[:BID_DESC_MAX]})
 
 def build_pitch(answer):
-    return f"Verified solution by colony-local-ai. Summary: {re.sub(r'\\s+', ' ', answer).strip()[:300]}"
+    cleaned_answer = re.sub(r'\s+', ' ', answer).strip()[:300]
+    return f"Verified solution by colony-local-ai. Summary: {cleaned_answer}"
 
 def merge_detail(headers, task):
     pid = str(task.get("id"))
