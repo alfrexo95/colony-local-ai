@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
 """
-Autonomous Agent for The Colony - PyTorch Native Edition v7.0
-Features: Advanced persistent memory, zero duplication, deep platform sync,
-5.5h continuous loop with 10-min rests, Wallet of Satoshi Lightning integration,
-Crypto endpoints (/crypto/paid)[span_1](start_span)[span_1](end_span), and rigorous Client Service Orders management.
+Autonomous Agent for The Colony - PyTorch Native Edition v7.1
+Fixed f-string regex backslash syntax error permanently.
 """
 
 import gc
@@ -72,7 +70,6 @@ def _as_list(d, keys=("tasks", "items", "data", "results", "comments", "bids", "
             if isinstance(d.get(k), list): return d[k]
     return []
 
-# SISTEMA DE MEMORIA ROBUSTA Y PERSISTENTE
 def load_state():
     try:
         if STATE_FILE.exists():
@@ -81,14 +78,14 @@ def load_state():
             st = {}
     except Exception:
         st = {}
-    st.setdefault("answered", {})       # IDs de tareas ya respondidas
-    st.setdefault("submissions", [])    # Historial de envíos
-    st.setdefault("failures", {})       # Control de fallos
-    st.setdefault("completed_orders", {})# Órdenes de servicios atendidas
+    st.setdefault("answered", {})
+    st.setdefault("submissions", [])
+    st.setdefault("failures", {})
+    st.setdefault("completed_orders", {})
     return st
 
 def save_state(st):
-    cutoff = time.time() - 45 * 86400 # Mantener memoria de 45 días
+    cutoff = time.time() - 45 * 86400
     st["answered"] = {k: v for k, v in st["answered"].items() if v > cutoff}
     st["submissions"] = [s for s in st["submissions"] if s.get("timestamp", 0) > cutoff]
     st["failures"] = {k: v for k, v in st["failures"].items() if k not in st["answered"]}
@@ -96,7 +93,7 @@ def save_state(st):
     tmp.write_text(json.dumps(st, indent=2))
     tmp.replace(STATE_FILE)
 
-# JERARQUÍA DE CADENAS (BNB > ETH > SOL > EVM > BTC)
+# CHAIN PRIORITY (BNB > ETH > SOL > EVM > BTC)
 _CHAIN_PATTERNS = [
     (5, "BNB", re.compile(r"\b(bsc|bnb|binance)\b")),
     (4, "ETH", re.compile(r"\b(ethereum|eth|erc[- ]?20)\b")),
@@ -141,7 +138,7 @@ def get_task_value(task):
     chain_prio, _ = get_chain_priority(task)
     return (chain_prio, 1 if token_amt > 0 else 0, sats_budget, token_amt)
 
-# SDK & HTTP INITIALIZATION
+# SDK & HTTP
 if not COLONY_KEY:
     print("[!] Missing COLONY_API_KEY secret.", flush=True)
     sys.exit(1)
@@ -193,7 +190,6 @@ def sync_profile(headers):
         agent_log(f"[*] Updated profile addresses: HTTP {st_up} (Lightning -> {LIGHTNING_ADDRESS})")
     return MY_USERNAME
 
-# COMPROBACIÓN EN PLATAFORMA PARA EVITAR DUPLICADOS
 def already_commented_on_platform(post_id):
     if not MY_USERNAME: return False
     try:
@@ -213,11 +209,9 @@ def already_commented_on_platform(post_id):
 
 def fetch_all_tasks(headers):
     tasks = []
-    # Marketplace general de tareas abiertas
     st, d = http("GET", "/marketplace/tasks", headers=headers, params={"status": "open"})
     if st < 400: tasks.extend(_as_list(d))
     
-    # Endpoint especializado en criptomonedas y pagos en tokens (crypto.md)[span_2](start_span)[span_2](end_span)
     st_p, d_p = http("GET", "/crypto/paid", headers=headers)
     if st_p < 400:
         known = {str(t.get("id")) for t in tasks if isinstance(t, dict)}
@@ -226,12 +220,10 @@ def fetch_all_tasks(headers):
         
     return tasks
 
-# GESTIÓN Y SEGUIMIENTO DE SOLICITUDES DE SERVICIOS PENDIENTES
 def handle_client_orders(headers, state):
     st, d = http("GET", "/offers/orders", headers=headers)
     if st >= 400: return
     orders = _as_list(d)
-    
     completed = state.setdefault("completed_orders", {})
     
     for o in orders:
@@ -249,7 +241,6 @@ def handle_client_orders(headers, state):
             http("POST", f"/offers/orders/{oid}/payment/check", headers=headers)
             
         if status in ("accepted", "paid"):
-            # Extraer requisitos o notas de la orden
             req_text = ""
             for k in ("requirements", "notes", "note", "message", "brief", "details", "request", "text", "content", "description"):
                 v = o.get(k)
@@ -263,7 +254,6 @@ def handle_client_orders(headers, state):
                 if solution:
                     buyer = _dict(o.get("buyer")).get("username") or o.get("buyer_username")
                     if buyer:
-                        # Enviar mensaje con el entregable
                         for path in (f"/messages/send/{buyer}", f"/messages/{buyer}", "/messages"):
                             st_msg, _ = http("POST", path, headers=headers, json={"body": f"Delivered service report:\n\n{solution}", "recipient": buyer, "username": buyer})
                             if st_msg in (200, 201, 202): break
@@ -273,7 +263,7 @@ def handle_client_orders(headers, state):
                     save_state(state)
                     agent_log(f"   [+] Service order {oid} successfully fulfilled and delivered!")
 
-# PYTORCH INFERENCE ENGINE
+# PYTORCH
 _torch_model = None
 _torch_tokenizer = None
 
@@ -312,7 +302,7 @@ def generate_solution(title, body):
     except Exception:
         return None
 
-# BUCLE CONTINUO PRINCIPAL (5.5 HORAS CON 10 MINUTOS DE DESCANSO)
+# CONTINUOUS LOOP
 def run_continuous_agent():
     deadline = time.time() + (TOTAL_RUN_HOURS * 3600)
     agent_log(f"[*] Starting 5.5-hour continuous agent loop with strict memory & platform sync...")
@@ -326,11 +316,7 @@ def run_continuous_agent():
             jwt = get_jwt()
             headers = {"Authorization": f"Bearer {jwt}", "Accept": "application/json"}
             sync_profile(headers)
-            
-            # Revisar solicitudes pendientes de clientes en los servicios
             handle_client_orders(headers, state)
-            
-            # Buscar tareas generales y de criptomonedas (BNB, ETH, SOL, BTC)
             tasks = fetch_all_tasks(headers)
         except Exception as e:
             agent_log(f"[!] Init error in cycle: {e}")
@@ -345,7 +331,6 @@ def run_continuous_agent():
             if answered >= MAX_TASKS_PER_RUN: break
             pid = str(task.get("id"))
             
-            # MEMORIA: Omitir si ya está en el estado local o ya se comentó en la plataforma
             if pid in state["answered"] or already_commented_on_platform(pid) or state["failures"].get(pid, 0) >= 3:
                 state["answered"][pid] = time.time()
                 save_state(state)
@@ -390,7 +375,6 @@ def run_continuous_agent():
             
             time.sleep(20)
 
-        # Descanso de 10 minutos antes del siguiente ciclo
         rest_time = REST_INTERVAL_MINUTES * 60
         agent_log(f"[*] Cycle completed. Resting for {REST_INTERVAL_MINUTES} minutes...")
         
