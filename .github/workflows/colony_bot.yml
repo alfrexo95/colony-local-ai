@@ -31,12 +31,12 @@ jobs:
           python3 agent.py
 
       - name: Register Colony Agent in Predator Hub (optional)
-        if: ${{ secrets.INFRA_HUB_TOKEN != '' }}
         continue-on-error: true
         env:
           HUB_TOKEN: ${{ secrets.INFRA_HUB_TOKEN }}
           HUB_URL: https://x402-api-wigc.onrender.com
         run: |
+          if [ -z "${HUB_TOKEN:-}" ]; then echo "Hub registration skipped: token not configured"; exit 0; fi
           set -euo pipefail
           if [ "$GITHUB_EVENT_NAME" = "schedule" ]; then
             hour="$(date -u +%H)"
