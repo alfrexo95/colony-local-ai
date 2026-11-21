@@ -2,12 +2,17 @@ name: Colony PyTorch Agent
 
 on:
   schedule:
-    - cron: '*/30 * * * *'
+    - cron: '0 */6 * * *' # Start once every six hours; agent cycle runs ~5.5h
   workflow_dispatch:
+
+concurrency:
+  group: colony-agent
+  cancel-in-progress: false
 
 jobs:
   run-agent:
     runs-on: ubuntu-latest
+    timeout-minutes: 360
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
